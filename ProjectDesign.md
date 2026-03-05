@@ -1,420 +1,431 @@
-# OpenClaw — Project Design Document
+# OpenClaw — Project Design Document (Simplified)
 
-**Platform:** Raspberry Pi  
-**Language:** Python (+ Bash for system-level tasks)  
-**Status:** Planning Phase
+**Platform:** Raspberry Pi 4  
+**Language:** Python 3.11+ (+ Bash for setup)  
+**Status:** Planning Phase  
+**Use case:** Personal — single private Discord channel as the sole command interface
 
 ---
 
 ## 1. High-Level Architecture
 
+Discord is the remote terminal. You send commands from your private channel; the Pi receives them via Discord's outbound websocket (no inbound ports, no tunneling). Every message flows through the orchestrator, which picks the right agent and routes LLM calls through a unified gateway that handles the intermittent LAN model transparently.
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Discord Interface                     │
-│         (commands in, status/responses out)              │
-└──────────────────────┬──────────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────────┐
-│                  Orchestrator (Core)                      │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
-│  │ Task Router  │  │ Agent Manager │  │ State Manager  │  │
-│  └──────┬──────┘  └──────┬───────┘  └───────┬────────┘  │
-└─────────┼────────────────┼──────────────────┼───────────┘
-          │                │                  │
-┌─────────▼────────────────▼──────────────────▼───────────┐
-│                   Agent Registry                         │
-│  ┌────────────┐ ┌────────────┐ ┌────────────┐           │
-│  │ Agent:Claw │ │ Agent:Chat │ │ Agent:Mod  │  ...      │
-│  │ (task-spec)│ │ (task-spec)│ │ (task-spec)│           │
-│  └─────┬──────┘ └─────┬──────┘ └─────┬──────┘           │
-│        │  isolated     │  isolated    │  isolated        │
-│        │  context      │  context     │  context         │
-└────────┼───────────────┼──────────────┼─────────────────┘
-         │               │              │
-┌────────▼───────────────▼──────────────▼─────────────────┐
-│                  LLM Router / Gateway                    │
-│  ┌──────────────┐ ┌────────────┐ ┌───────────────────┐  │
-│  │ LAN LLM      │ │ Claude API │ │ OpenAI API        │  │
-│  │ (primary,    │ │ (fallback/ │ │ (fallback/        │  │
-│  │  intermittent)│ │  specialty)│ │  specialty)       │  │
-│  └──────────────┘ └────────────┘ └───────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│           Private Discord Channel (you)               │
+│        commands in ──── responses/status out           │
+└────────────────────────┬─────────────────────────────┘
+                         │  outbound websocket only
+┌────────────────────────▼─────────────────────────────┐
+│                    Orchestrator                        │
+│         ┌──────────────┐  ┌──────────────┐            │
+│         │ Task Router   │  │ State Manager │            │
+│         └──────┬───────┘  └──────┬───────┘            │
+└────────────────┼─────────────────┼───────────────────┘
+                 │                 │
+┌────────────────▼─────────────────▼───────────────────┐
+│                  Agent Registry                       │
+│    ┌────────────┐  ┌────────────┐                     │
+│    │ Agent:Claw │  │ Agent:Chat │   ...more via       │
+│    │ (isolated) │  │ (isolated) │   /newagent          │
+│    └─────┬──────┘  └─────┬──────┘                     │
+└──────────┼───────────────┼───────────────────────────┘
+           │               │
+┌──────────▼───────────────▼───────────────────────────┐
+│               LLM Gateway + Health Monitor            │
+│    ┌──────────────┐  ┌──────────┐  ┌──────────────┐  │
+│    │ LAN LLM      │  │ Claude   │  │ OpenAI       │  │
+│    │ (preferred)   │  │ (fallback)│  │ (fallback)   │  │
+│    └──────────────┘  └──────────┘  └──────────────┘  │
+└──────────────────────────────────────────────────────┘
+           │
+┌──────────▼───────────────────────────────────────────┐
+│              Hardware (Claw Controller)                │
+│              GPIO via RPi.GPIO / gpiozero             │
+└──────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 2. Directory Structure
 
+Flattened from the previous version. The moderation agent, safety watchdog, sensor reader, and resource monitor are gone — you're standing next to the claw and it's your Pi.
+
 ```
 openclaw/
-├── main.py                     # Entry point, starts orchestrator + Discord bot
+├── main.py                     # Entry point — starts Discord bot + orchestrator
 ├── config/
-│   ├── settings.yaml           # Global config (LLM endpoints, Pi GPIO pins, timeouts)
-│   ├── agents.yaml             # Agent definitions and task-type mappings
+│   ├── settings.yaml           # LLM endpoints, GPIO pins, timeouts, agent defaults
+│   ├── agents.yaml             # Builtin agent definitions + any runtime-created ones
 │   └── secrets.env             # API keys (gitignored)
 │
 ├── core/
 │   ├── __init__.py
-│   ├── orchestrator.py         # Central coordinator — routes tasks, manages lifecycle
-│   ├── task_router.py          # Classifies incoming requests → task type → agent
-│   └── state_manager.py        # Persists agent state, conversation context, Pi state
+│   ├── orchestrator.py         # Routes tasks, manages agent lifecycle
+│   ├── task_router.py          # Message → task type → agent lookup
+│   └── state_manager.py        # Persists agent state + context to disk
 │
 ├── agents/
 │   ├── __init__.py
 │   ├── base_agent.py           # Abstract base: system prompt, memory, LLM binding
-│   ├── agent_factory.py        # Creates new agents for new task types at runtime
-│   ├── agent_registry.py       # Registers, discovers, and retrieves active agents
+│   ├── agent_factory.py        # Creates new agents at runtime
+│   ├── agent_registry.py       # Tracks all active agents
 │   └── builtin/
-│       ├── claw_agent.py       # Controls the physical claw via GPIO commands
-│       ├── chat_agent.py       # General conversational agent for Discord
-│       └── moderation_agent.py # Server moderation / filtering agent
+│       ├── claw_agent.py       # Emits structured GPIO commands
+│       └── chat_agent.py       # General-purpose conversational agent
 │
 ├── llm/
 │   ├── __init__.py
-│   ├── gateway.py              # Unified interface: send prompt → get completion
-│   ├── router.py               # Picks backend based on availability + task needs
+│   ├── gateway.py              # Unified async interface — agents call this, never backends
+│   ├── router.py               # Picks backend: LAN → Claude → OpenAI (with circuit breaker)
 │   ├── backends/
-│   │   ├── lan_llm.py          # Client for your local LAN-hosted model
-│   │   ├── claude_api.py       # Anthropic API client
-│   │   └── openai_api.py       # OpenAI API client
-│   └── health_monitor.py       # Pings LAN LLM, tracks availability windows
+│   │   ├── lan_llm.py          # httpx client for local model (Ollama/llama.cpp/etc.)
+│   │   ├── claude_api.py       # Anthropic SDK wrapper
+│   │   └── openai_api.py       # OpenAI SDK wrapper
+│   └── health_monitor.py       # Async ping loop for LAN LLM availability
 │
 ├── hardware/
 │   ├── __init__.py
-│   ├── claw_controller.py      # GPIO interface — move, grab, release, home
-│   ├── sensor_reader.py        # Any sensors (position, limit switches, current)
-│   └── safety.py               # Watchdog timers, current limits, emergency stop
+│   └── claw_controller.py      # All GPIO in one place — move, grab, release, home
 │
 ├── discord_bot/
 │   ├── __init__.py
-│   ├── bot.py                  # discord.py bot setup, event loop
-│   ├── commands.py             # Slash commands: /claw, /status, /ask, /newagent
-│   ├── listeners.py            # Message listeners for passive monitoring
-│   └── formatters.py           # Embeds, status cards, response formatting
+│   ├── bot.py                  # discord.py client, event loop, message dispatch
+│   └── commands.py             # Slash commands + plain-message parsing
 │
 ├── memory/
 │   ├── __init__.py
-│   ├── context_store.py        # Per-agent conversation/context persistence
-│   ├── task_memory.py          # Per-task-type long-term knowledge (avoids forgetting)
-│   └── vector_store.py         # Optional: lightweight local embeddings for retrieval
+│   ├── context_store.py        # Per-agent rolling conversation buffer
+│   └── task_memory.py          # Per-agent persistent knowledge (JSON/SQLite)
 │
 ├── utils/
 │   ├── __init__.py
-│   ├── logging_config.py       # Structured logging (rotating file + stdout)
-│   ├── retry.py                # Exponential backoff for flaky LAN/API calls
-│   └── resource_monitor.py     # CPU/RAM/temp monitoring for the Pi
+│   ├── logging_config.py       # Rotating file logger (stdlib logging, no extra deps)
+│   └── retry.py                # Tenacity wrappers for LLM calls
 │
 ├── scripts/
-│   ├── setup_pi.sh             # System dependencies, GPIO permissions, venv creation
-│   ├── install.sh              # pip install, config scaffolding
-│   ├── healthcheck.sh          # Cron-friendly: is the bot alive? Is the LAN LLM up?
-│   └── deploy.sh               # Pull, install, restart systemd service
+│   ├── setup.sh                # venv, pip install, config scaffolding (distro-agnostic)
+│   └── deploy.sh               # git pull + restart service
 │
 ├── tests/
 │   ├── test_llm_gateway.py
 │   ├── test_agent_factory.py
-│   ├── test_claw_controller.py # Mock GPIO for CI
-│   └── test_discord_commands.py
+│   └── test_claw_controller.py
 │
 ├── systemd/
-│   └── openclaw.service        # systemd unit file for autostart on boot
+│   └── openclaw.service        # Auto-start on boot (optional — see note on portability)
 │
 ├── requirements.txt
-├── pyproject.toml
 └── README.md
 ```
+
+**What got cut and why:**
+
+| Removed | Reason |
+|---|---|
+| `moderation_agent.py` | Private channel, single user — no moderation needed |
+| `safety.py`, `sensor_reader.py` | You're physically present; hardware monitoring is overhead |
+| `resource_monitor.py` | Pi 4 thermals are fine for this workload without active monitoring |
+| `listeners.py`, `formatters.py` | Single channel — commands.py handles everything; embeds are nice-to-have, not a separate file |
+| `healthcheck.sh` | Folded into a `/status` command — you'll notice if the bot goes offline |
+| `vector_store.py` | Deferred — context summarization is enough initially; add RAG later if needed |
 
 ---
 
 ## 3. Component Design
 
-### 3.1 LLM Router / Gateway
+### 3.1 LLM Gateway + Health Monitor
 
-This is the most critical abstraction. Every agent talks to a single `LLMGateway` — it never knows or cares which backend answers.
-
-**Routing logic (priority order):**
-
-1. **LAN LLM** — preferred when available (free, low-latency on LAN, no token cost). The health monitor pings it every N seconds and maintains a `is_available` flag.
-2. **Claude API** — fallback for complex reasoning, tool use, or when LAN is down.
-3. **OpenAI API** — second fallback, or preferred for specific tasks (e.g., vision, function calling with specific models).
-
-**Key interface:**
+Every agent calls `gateway.complete()`. It never knows which backend answers.
 
 ```python
+@dataclass
+class CompletionResult:
+    text: str
+    backend_used: str       # "lan", "claude", "openai"
+    latency_ms: float
+    usage: dict | None      # token counts if the backend reports them
+
 class LLMGateway:
     async def complete(
         self,
         messages: list[dict],
         system_prompt: str,
-        backend_preference: str | None = None,  # "lan", "claude", "openai", or None for auto
+        backend_preference: str | None = None,  # override auto-routing
         max_tokens: int = 1024,
         temperature: float = 0.7,
     ) -> CompletionResult:
-        """Route to best available backend, return unified result."""
+        ...
 ```
 
-**Key considerations:**
+**Routing priority:** LAN LLM → Claude → OpenAI. The router checks `health_monitor.is_available` before attempting the LAN backend.
 
-- **Intermittent LAN LLM:** The health monitor must be non-blocking. Use an async ping loop that updates a shared flag. The router checks the flag synchronously — never blocks waiting for the LAN model to come online.
-- **Graceful degradation:** If all backends are down, queue the request and notify via Discord that the system is in degraded mode.
-- **Token budget tracking:** Log token usage per backend per agent. Pi has limited storage, so rotate logs aggressively.
-- **Response normalization:** Each backend returns different shapes. The gateway normalizes everything into a single `CompletionResult(text, usage, backend_used, latency_ms)`.
+**Circuit breaker for LAN intermittency:** After 3 consecutive failures (timeout or connection refused), the router marks the LAN LLM as down for 60 seconds, then sends a single probe. This avoids stacking 30-second timeouts on every request while the LAN host is asleep. When the LAN LLM comes back, the bot posts a short notice to your Discord channel.
 
-### 3.2 Agent System (Avoiding Catastrophic Forgetting)
+**Timeouts:** Health check ping: 3s. Completion request: 45s for LAN, 30s for cloud APIs.
 
-The core idea: **each task type gets its own agent with isolated context, system prompt, and memory.** No single monolithic agent tries to do everything.
+**Response normalization:** Each backend returns a different shape (Ollama returns `{"response": ...}`, Anthropic returns `{"content": [...]}`). The backend wrappers in `backends/` each implement the same `async def complete(...)` signature and return a uniform `CompletionResult`. The gateway never parses raw API responses.
 
-**Base agent structure:**
+### 3.2 Agent System
+
+**The core anti-forgetting pattern: one task type → one agent → isolated everything.**
 
 ```python
-class BaseAgent:
-    agent_id: str               # unique, e.g. "claw-control-v1"
-    task_type: str              # e.g. "claw_operation", "general_chat", "moderation"
-    system_prompt: str          # task-specific persona and instructions
-    memory: TaskMemory          # isolated long-term memory for this task type
-    context_window: list[dict]  # rolling conversation buffer (capped size)
-    llm_preference: str | None  # can pin an agent to a specific backend
+class BaseAgent(ABC):
+    agent_id: str               # e.g. "claw-v1", "chat-v1", "recipe-helper"
+    task_type: str              # routing key
+    system_prompt: str          # what this agent is and does
+    memory: TaskMemory          # persistent, namespaced to this agent
+    context: list[dict]         # rolling window of recent messages
+    llm_preference: str | None  # pin to a backend if needed
+
+    async def handle(self, message: str, context: dict) -> str:
+        """Process a routed message and return a response."""
+        ...
+
+    def summarize_context(self) -> str:
+        """Compress old context into a memory block when window fills up."""
+        ...
 ```
 
-**Agent Factory — creating agents for new task types:**
+**Agent Factory:**
 
 ```python
 class AgentFactory:
-    def create_agent(
+    def create(
         self,
         task_type: str,
         system_prompt: str,
         llm_preference: str | None = None,
-        memory_strategy: str = "rolling_window",  # or "rag", "summarize"
+        context_limit: int = 50,     # max messages before summarization
     ) -> BaseAgent:
         """
-        Instantiate a new agent with:
-        - A fresh, isolated memory store
-        - Its own system prompt (no bleed from other agents)
-        - Registered in the AgentRegistry for routing
+        1. Instantiate agent with fresh isolated memory
+        2. Register it in the AgentRegistry
+        3. Persist config to agents.yaml so it survives restarts
         """
 ```
 
-**How catastrophic forgetting is avoided:**
-
-| Strategy | How it works |
-|---|---|
-| **Isolation** | Each agent has its own system prompt and memory. Learning about claw physics never overwrites chat personality. |
-| **Persistent task memory** | Each agent's accumulated knowledge is saved to disk (JSON/SQLite) under a namespaced key. On restart, the agent reloads its own history. |
-| **No shared weights** | Since we're calling external LLMs (not fine-tuning), "forgetting" means context window overflow, not weight drift. We manage this with summarization and RAG. |
-| **Context summarization** | When an agent's context window fills up, older messages are summarized into a condensed "memory block" prepended to the system prompt rather than dropped entirely. |
-| **Optional RAG** | For agents that accumulate a lot of knowledge (e.g., a moderation agent learning server-specific rules), a lightweight local vector store (ChromaDB or FAISS with sentence-transformers) enables retrieval without stuffing everything into the prompt. |
-
-**Runtime agent creation via Discord:**
-
-A `/newagent` slash command lets you define a new agent on the fly:
+Called by the `/newagent` command:
 ```
-/newagent type:recipe_helper prompt:"You are a cooking assistant..." backend:claude
+/newagent type:recipe_helper prompt:You are a cooking assistant that gives concise recipes.
 ```
-This calls `AgentFactory.create_agent()`, registers it, and immediately makes it available for routing.
 
-### 3.3 Hardware Interface (Claw Controller)
+**How forgetting is avoided:**
+
+The three failure modes and their mitigations:
+
+1. **Context window overflow** — When an agent's rolling context hits its limit, older exchanges are summarized by the LLM into a compressed "memory block" that gets prepended to the system prompt. Raw messages are dropped, but the knowledge is retained in summary form.
+
+2. **Prompt drift** — Each agent has a single, narrow system prompt that never changes. A claw agent never gets asked about recipes. If a new kind of task appears, it gets a new agent, not new instructions bolted onto an existing one.
+
+3. **Cross-task contamination** — Agent memory is namespaced. `~/.openclaw/state/agents/claw-v1.json` and `chat-v1.json` are completely separate files. No shared context, no shared memory, no bleed.
+
+### 3.3 Hardware Interface
+
+Simplified to a single file. The claw agent emits structured JSON commands; the orchestrator forwards them to `ClawController`.
 
 ```python
 class ClawController:
-    """All GPIO interaction is isolated here. Nothing else touches pins."""
+    """All GPIO access lives here. Nothing else imports RPi.GPIO."""
 
-    def move(self, axis: str, direction: str, duration_ms: int) -> MoveResult
-    def grab(self) -> GrabResult
-    def release(self) -> None
-    def home(self) -> None          # return to known position
-    def emergency_stop(self) -> None # kill all motors immediately
-    def get_position(self) -> Position
+    def __init__(self, pin_config: dict):
+        # pin_config loaded from settings.yaml
+        ...
+
+    def move(self, axis: str, direction: str, duration_ms: int) -> dict
+    def grab(self) -> dict
+    def release(self) -> dict
+    def home(self) -> dict
+    def emergency_stop(self) -> dict
 ```
 
-**Safety layer** (`safety.py`):
-
-- Watchdog timer: if no command received in N seconds, auto-home.
-- Current monitoring: if motor current exceeds threshold, stop and report.
-- Boundary limits: software-enforced position limits even if limit switches fail.
-- All safety checks run in a separate thread/process, not dependent on the main event loop.
-
-**How agents control hardware:**
-
-The claw agent doesn't call GPIO directly. It emits structured commands (JSON), which the orchestrator validates and forwards to `ClawController`. This keeps the agent sandboxed.
-
+**Agent → Hardware flow:**
 ```
-Agent output:  {"action": "move", "axis": "x", "direction": "left", "duration_ms": 500}
-Orchestrator:  validates schema → calls claw_controller.move("x", "left", 500)
+claw_agent returns: {"action": "move", "axis": "x", "direction": "left", "duration_ms": 500}
+orchestrator validates action exists → calls claw_controller.move("x", "left", 500)
+result dict sent back to Discord
 ```
 
-### 3.4 Discord Bot Interface
+The agent never imports GPIO libraries. If you're testing on a non-Pi machine, the controller can be swapped for a mock that just logs commands — the rest of the system doesn't notice.
 
-Built with `discord.py` (async, well-maintained, supports slash commands).
+### 3.4 Discord Bot
 
-**Command flow:**
+Single private channel. The bot connects outbound to Discord's gateway (websocket) — no ports opened on the Pi. You send messages; the bot receives them, routes through the orchestrator, and replies in the same channel.
 
-```
-User sends /claw grab
-  → bot.py receives interaction
-  → commands.py parses intent
-  → orchestrator.task_router classifies as "claw_operation"
-  → agent_registry finds claw_agent
-  → claw_agent calls LLMGateway (if reasoning needed) or acts directly
-  → result flows back through orchestrator
-  → formatters.py builds an embed
-  → bot sends response to channel
-```
+**Message handling** — Two paths, both handled in `commands.py`:
 
-**Key commands:**
+1. **Slash commands** — structured, easy to parse: `/claw grab`, `/ask what is X`, `/newagent ...`, `/status`
+2. **Plain messages** — the bot listens for any message in the channel (or @mentions) and feeds it to the task router, which uses a simple keyword/regex match (or optionally an LLM classification call) to pick the right agent.
 
-| Command | Description |
+**Commands:**
+
+| Command | What it does |
 |---|---|
-| `/claw <action>` | Direct claw control (move, grab, release, home) |
-| `/ask <question>` | Route to appropriate agent based on content |
-| `/status` | System health: Pi temp/CPU, LLM availability, agent count |
-| `/newagent` | Create a new task-specific agent at runtime |
-| `/agents` | List all registered agents and their status |
-| `/logs <agent>` | Retrieve recent activity for a specific agent |
+| `/claw <action>` | Move, grab, release, home |
+| `/ask <question>` | Route to best-matching agent |
+| `/newagent type:<t> prompt:<p>` | Create and register a new agent |
+| `/agents` | List registered agents |
+| `/status` | LLM backend availability, uptime, agent count |
 
-**Listeners (passive):**
-
-- Monitor specific channels for messages that match patterns (e.g., "hey bot, ..." or @mentions).
-- Feed matched messages to the task router just like slash commands.
+**Why discord.py:** It's async-native, supports slash commands in v2.x, and handles the websocket lifecycle for you. The bot's event loop is the application's main loop; everything else (LLM calls, GPIO) is dispatched as async tasks or thread pool calls within it.
 
 ### 3.5 State Management
 
-All state lives on the Pi's filesystem (SD card or USB SSD).
+All state is flat files under `~/.openclaw/`. SQLite is used only for task memory (structured queries), everything else is JSON or YAML.
 
 ```
 ~/.openclaw/
 ├── state/
 │   ├── agents/
-│   │   ├── claw-control-v1.json      # agent config + memory snapshot
-│   │   ├── general-chat-v1.json
-│   │   └── ...
-│   ├── llm_usage.json                 # token counts per backend per day
-│   └── hardware_state.json            # last known claw position, calibration
-├── logs/
-│   ├── openclaw.log                   # rotating, 10MB max, 3 files
-│   └── discord.log
-└── vector_db/                         # optional, for RAG-enabled agents
-    └── chroma/
+│   │   ├── claw-v1.json          # agent config + summarized memory
+│   │   ├── chat-v1.json
+│   │   └── recipe-helper.json    # runtime-created agent
+│   └── llm_usage.json            # token counts per backend (rotated daily)
+└── logs/
+    └── openclaw.log              # single rotating log, 5MB × 3 files
 ```
+
+State is saved on a debounced timer (every 60s if dirty) rather than on every message. This reduces SD card writes. If you add a USB drive later, just change the base path in `settings.yaml`.
 
 ---
 
-## 4. Key Interfaces Between Components
+## 4. Data Flow
 
 ```
-Discord Bot ──(async message queue)──► Orchestrator
-Orchestrator ──(task classification)──► Task Router
-Task Router ──(agent lookup)──────────► Agent Registry
-Agent Registry ──(dispatch)───────────► Specific Agent
-Agent ──(prompt + messages)───────────► LLM Gateway
-LLM Gateway ──(health check)─────────► Health Monitor
-LLM Gateway ──(API call)─────────────► LAN / Claude / OpenAI
-Agent ──(structured command)──────────► Orchestrator ──► Claw Controller
-Agent ──(read/write)──────────────────► Task Memory / Context Store
+You (Discord) ──msg──► bot.py ──► orchestrator.task_router
+                                        │
+                              ┌─────────▼──────────┐
+                              │  agent_registry     │
+                              │  find by task_type  │
+                              └─────────┬──────────┘
+                                        │
+                              ┌─────────▼──────────┐
+                              │  matched agent      │
+                              │  (e.g. claw_agent)  │
+                              └─────────┬──────────┘
+                                        │
+                    ┌───────────────────┤
+                    ▼                    ▼
+            LLM Gateway           ClawController
+            (if reasoning          (if hardware
+             needed)                action needed)
+                    │                    │
+                    ▼                    ▼
+            CompletionResult        MoveResult / etc.
+                    │                    │
+                    └────────┬───────────┘
+                             ▼
+                    orchestrator combines
+                    response + result
+                             │
+                             ▼
+                    bot.py sends reply
+                    to Discord channel
 ```
 
-All inter-component communication is **async** (asyncio). The Discord bot event loop is the main loop; hardware commands are dispatched to a thread pool to avoid blocking.
+All async. GPIO calls are wrapped in `asyncio.to_thread()` since RPi.GPIO is synchronous.
 
 ---
 
 ## 5. Key Considerations
 
-### 5.1 Raspberry Pi Constraints
+### 5.1 Pi 4 Specifics
 
-- **RAM:** Likely 1–8 GB depending on model. Budget carefully. No local model inference — all LLM calls go to LAN or cloud. Keep vector DB small or skip it initially.
-- **CPU:** Adequate for orchestration, GPIO, and Discord bot. Not adequate for any ML inference.
-- **Storage:** SD cards are slow and wear out. Use a USB SSD for state/logs if possible. Minimize write frequency (batch state saves, don't write every message).
-- **Thermal:** Monitor CPU temp via `resource_monitor.py`. Throttle activity if temp exceeds 75°C. The Pi will thermal-throttle on its own at 80°C, but you want to catch it earlier.
-- **Network:** Reliable WiFi/Ethernet is essential. The intermittent LAN LLM makes network handling the most likely failure point.
+The Pi 4 has 1–8 GB RAM and a BCM2711 SoC. For this workload (no local inference, just orchestration + GPIO + network I/O), even the 2 GB model is fine. Key points:
 
-### 5.2 LAN LLM Intermittency
+- **GPIO library:** `RPi.GPIO` works well on Pi 4. `gpiozero` is a friendlier wrapper if you prefer. Both are available via pip and don't tie you to a specific distro.
+- **Python:** Use 3.11+ for `asyncio.TaskGroup` and performance improvements. Install via your distro's package manager or `pyenv` if the system Python is too old.
+- **SD card wear:** Debounce writes (see state management above). If the Pi runs 24/7, consider a USB SSD for `~/.openclaw/` — SD cards degrade over months of continuous logging.
 
-This is the hardest engineering problem in the project.
+### 5.2 Distro Agnosticism
 
-- **Don't assume availability.** Every call through the gateway must have a timeout (2–5s for health check, 30–60s for completion).
-- **Circuit breaker pattern:** After N consecutive failures, stop trying the LAN LLM for M seconds before probing again. This prevents piling up timeouts.
-- **Queue + retry:** If a task isn't urgent, queue it for the LAN LLM and retry when it comes back online. Store the queue in SQLite so it survives restarts.
-- **Notify on state changes:** When the LAN LLM goes up or down, post a message to a Discord status channel.
+The project avoids distro-specific assumptions where practical:
 
-### 5.3 Catastrophic Forgetting — Deeper Notes
+| Concern | Approach |
+|---|---|
+| **Python** | Use a venv. `setup.sh` checks for `python3` ≥ 3.11 and creates one. |
+| **GPIO** | `RPi.GPIO` / `gpiozero` are pip packages, not distro-specific. |
+| **Service management** | `systemd/openclaw.service` is provided since virtually all Pi distros use systemd (Raspberry Pi OS, Ubuntu, DietPi, Armbian). If someone doesn't have systemd, they can run `main.py` in a `tmux`/`screen` session instead. |
+| **Dependencies** | `setup.sh` installs via pip inside the venv. System-level deps (if any) are called out with both `apt` and generic names so you can adapt. |
+| **Config paths** | `~/.openclaw/` uses `$HOME`, not a hardcoded path. |
 
-Since you're calling external APIs (not training/fine-tuning), "forgetting" manifests as:
+The one unavoidable Pi-specific tie is the GPIO library. If you ever port this to a non-Pi SBC, you'd swap `claw_controller.py` and its imports — the rest of the system is unaffected.
 
-1. **Context window overflow** — old context gets truncated, losing learned information. Mitigate with summarization and RAG.
-2. **Prompt drift** — if a single agent accumulates too many responsibilities, its system prompt becomes incoherent. Mitigate by keeping agents narrowly scoped.
-3. **Cross-task contamination** — if agents share memory, claw-control knowledge could pollute chat responses. Mitigate with strict isolation.
+### 5.3 LAN LLM Intermittency
 
-The agent factory pattern solves all three: new task, new agent, fresh context, isolated memory.
+This remains the trickiest part of the project. The design handles it at three levels:
 
-### 5.4 Security
+1. **Health monitor** — A background async task pings the LAN endpoint every 15 seconds. Maintains a simple boolean `is_available` flag plus a `last_seen` timestamp.
 
-- **API keys** in `secrets.env`, loaded via `python-dotenv`, never logged, never sent to Discord.
-- **Discord permissions:** The bot should request minimal permissions. Claw commands should be restricted to specific roles.
-- **Hardware sandboxing:** Agents never touch GPIO directly. The orchestrator validates every hardware command against a schema before forwarding.
-- **Rate limiting:** Cap the number of LLM calls per agent per minute to prevent runaway loops.
+2. **Circuit breaker in the router** — 3 failures → mark down for 60s → probe → repeat. Prevents every user command from eating a 45-second timeout when the LAN host is off.
 
-### 5.5 Deployment & Operations
+3. **Fallback** — When the LAN model is unavailable, requests automatically go to Claude or OpenAI. The `CompletionResult.backend_used` field lets you (or the agent) know which backend answered, if that ever matters.
 
-- **systemd service** for auto-start on boot and auto-restart on crash.
-- **`healthcheck.sh`** run via cron every 5 minutes — checks if the process is alive, if Discord is connected, if the LAN LLM is reachable. Sends a Discord webhook alert on failure.
-- **Rolling updates:** `deploy.sh` does `git pull`, `pip install -r requirements.txt`, `systemctl restart openclaw`. Keep it simple.
+No queuing for now — if you send a command and the LAN is down, it falls back immediately. Queuing adds complexity that isn't needed when cloud fallbacks exist.
+
+### 5.4 Catastrophic Forgetting — Summary
+
+Since all LLM calls are stateless API requests (no fine-tuning, no local weights), "forgetting" is purely a context management problem. The agent factory pattern solves it:
+
+- **New task → new agent.** Never overload one agent with unrelated responsibilities.
+- **Isolated memory.** Each agent's context and persistent memory are namespaced on disk.
+- **Summarization over truncation.** When context fills up, compress old exchanges into a summary rather than dropping them.
+
+If an agent eventually needs to recall large amounts of historical knowledge (e.g., hundreds of past claw operations), that's when you'd add a vector store (ChromaDB, FAISS) as a future enhancement. For now, rolling context + summarization is enough.
 
 ---
 
-## 6. Suggested Build Order
+## 6. Build Order
 
-| Phase | What to build | Why this order |
+| Phase | Build | Proves |
 |---|---|---|
-| **1** | `llm/gateway.py`, `llm/router.py`, `llm/backends/lan_llm.py` | Get a single LLM call working end-to-end. This unblocks everything else. |
-| **2** | `agents/base_agent.py`, `agents/agent_factory.py`, `agents/agent_registry.py` | Establish the agent pattern before building specific agents. |
-| **3** | `core/orchestrator.py`, `core/task_router.py` | Wire agents to the gateway through a central coordinator. |
-| **4** | `agents/builtin/chat_agent.py` + basic tests | A simple chat agent proves the full pipeline works. |
-| **5** | `discord_bot/bot.py`, `discord_bot/commands.py` | Now you have a working bot you can talk to on Discord. |
-| **6** | `hardware/claw_controller.py`, `hardware/safety.py` | Add physical claw control with safety layer. |
-| **7** | `agents/builtin/claw_agent.py` | The claw agent can now reason about and issue hardware commands. |
-| **8** | `llm/backends/claude_api.py`, `llm/backends/openai_api.py` | Add cloud fallbacks. |
-| **9** | `memory/context_store.py`, `memory/task_memory.py` | Persistent memory so agents survive restarts. |
-| **10** | `llm/health_monitor.py`, `scripts/healthcheck.sh`, systemd | Production hardening. |
+| **1** | `llm/gateway.py` + `llm/backends/lan_llm.py` | You can call the LAN LLM from Python and get a response back. |
+| **2** | `llm/router.py` + `llm/health_monitor.py` | Automatic failover works — kill the LAN model mid-conversation and cloud picks up. |
+| **3** | `agents/base_agent.py` + `agent_factory.py` + `agent_registry.py` | You can create, register, and dispatch to isolated agents. |
+| **4** | `agents/builtin/chat_agent.py` | Full pipeline: message in → agent → LLM → response out (tested locally, no Discord yet). |
+| **5** | `discord_bot/bot.py` + `commands.py` | Bot connects, receives commands, replies. You can `/ask` and get a response. |
+| **6** | `core/orchestrator.py` + `task_router.py` | Multi-agent routing works — different messages hit different agents. |
+| **7** | `hardware/claw_controller.py` + `agents/builtin/claw_agent.py` | `/claw grab` makes the physical claw move. |
+| **8** | `memory/context_store.py` + `task_memory.py` + `state_manager.py` | Agents survive restarts with their memory intact. |
+| **9** | `llm/backends/claude_api.py` + `openai_api.py` | Cloud fallbacks wired up. |
+| **10** | `scripts/setup.sh`, `systemd/openclaw.service`, final cleanup | Runs unattended on boot. |
 
 ---
 
-## 7. Dependencies (Initial)
+## 7. Dependencies
 
-```
+```txt
 # Core
-asyncio             # stdlib
-pyyaml              # config parsing
-python-dotenv       # secrets loading
+pyyaml              # config files
+python-dotenv       # load secrets.env
 
 # Discord
-discord.py          # bot framework (v2.x for slash commands)
+discord.py>=2.0     # async bot with slash command support
 
-# LLM Clients
-anthropic           # Claude API
-openai              # OpenAI API
-httpx               # async HTTP for LAN LLM + health checks
+# LLM clients
+httpx               # async HTTP for LAN LLM (Ollama, llama.cpp, etc.)
+anthropic           # Claude API (install when needed)
+openai              # OpenAI API (install when needed)
 
 # Hardware
-RPi.GPIO            # GPIO control (or gpiozero for a friendlier API)
-# lgpio             # alternative if running on Pi 5 (RPi.GPIO has issues)
+RPi.GPIO            # GPIO on Pi 4 (or gpiozero as alternative)
 
-# State / Memory
-aiosqlite           # async SQLite for state persistence
-chromadb            # optional, for RAG vector store
+# State
+aiosqlite           # async SQLite for task memory
 
 # Utilities
-structlog           # structured logging
-tenacity            # retry logic
-psutil              # system resource monitoring
+tenacity            # retry/backoff for flaky calls
 ```
+
+Kept deliberately small. `structlog`, `psutil`, and `chromadb` from the previous version are dropped — stdlib `logging` is fine, you don't need process monitoring, and RAG is deferred.
 
 ---
 
-## 8. Open Questions for Next Phase
+## 8. Open Questions
 
-1. **Which LAN LLM?** (Ollama? llama.cpp server? vLLM?) — determines the client protocol in `lan_llm.py`.
-2. **Claw hardware specifics** — stepper vs servo motors, how many axes, what driver board?
-3. **Pi model** — Pi 4 vs Pi 5 affects GPIO library choice and available RAM.
-4. **Discord server structure** — dedicated channels for claw control vs general chat vs status?
-5. **Token budget** — monthly spend cap for Claude/OpenAI APIs? This affects routing aggressiveness toward the LAN LLM.
-6. **RAG necessity** — is lightweight context summarization enough initially, or do agents need retrieval from day one?
+1. **Which LAN LLM server?** Ollama exposes an OpenAI-compatible `/v1/chat/completions` endpoint, which would let `lan_llm.py` reuse the same request shape as `openai_api.py`. llama.cpp's server has a slightly different API. This choice affects how much code goes into the LAN backend.
+2. **Claw hardware** — stepper vs servo, number of axes, driver board. This determines the `ClawController` implementation.
+3. **Token budget** — any monthly cap on Claude/OpenAI spend? If so, the router should track cumulative usage and refuse cloud calls past a threshold.
+4. **Context window strategy** — how aggressive should summarization be? Summarize after 20 messages? 50? Should the summarization call itself use the LAN LLM or a cloud model?
