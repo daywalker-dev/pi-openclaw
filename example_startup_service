@@ -1,0 +1,11 @@
+#!/bin/bash
+
+cd /home/pi/Documents/pi-openclaw/
+
+ssh-agent bash -c "git pull origin"
+
+while true
+do
+	/usr/bin/openclaw
+	sleep 5
+done

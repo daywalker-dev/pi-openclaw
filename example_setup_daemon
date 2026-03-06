@@ -1,0 +1,22 @@
+#!/bin/bash
+
+sudo chmod +x /home/pi/Documents/pi-openclaw/jobs/example_startup_service
+
+cd /etc/systemd/system
+
+sudo echo "[Unit]
+Description='OpenClaw startup service.'
+
+[Service]
+User=pi
+ExecStart=/home/pi/Documents/pi-openclaw/jobs/example_startup_service
+Restart=always
+
+[Install]
+WantedBy=multi-user.target" > startup-service.service
+
+
+sudo systemctl daemon-reload
+sudo systemctl start startup-service.service
+sudo systemctl enable startup-service.service
+sudo systemctl daemon-reload
