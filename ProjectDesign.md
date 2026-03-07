@@ -13,36 +13,36 @@ Discord is the remote terminal. You send commands from your private channel; you
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│           Private Discord Channel (you)               │
-│        commands in ──── responses/status out           │
+│           Private Discord Channel (you)              │
+│        commands in ──── responses/status out         │
 └────────────────────────┬─────────────────────────────┘
                          │  outbound websocket only
 ┌────────────────────────▼─────────────────────────────┐
-│                    Orchestrator                        │
-│         ┌──────────────┐  ┌──────────────┐            │
-│         │ Task Router   │  │ State Manager │            │
-│         └──────┬───────┘  └──────┬───────┘            │
+│                    Orchestrator                      │
+│         ┌──────────────┐  ┌──────────────┐           │
+│         │ Task Router  │  │ State Manager│           │
+│         └──────┬───────┘  └──────┬───────┘           │
 └────────────────┼─────────────────┼───────────────────┘
                  │                 │
 ┌────────────────▼─────────────────▼───────────────────┐
-│                  Agent Registry                       │
-│    ┌────────────┐  ┌────────────┐                     │
-│    │ Agent:Claw │  │ Agent:Chat │   ...more via       │
-│    │ (isolated) │  │ (isolated) │   /newagent          │
-│    └─────┬──────┘  └─────┬──────┘                     │
+│                  Agent Registry                      │
+│    ┌────────────┐  ┌────────────┐                    │
+│    │ Agent:Claw │  │ Agent:Chat │   ...more via      │
+│    │ (isolated) │  │ (isolated) │   /newagent        │
+│    └─────┬──────┘  └─────┬──────┘                    │
 └──────────┼───────────────┼───────────────────────────┘
            │               │
 ┌──────────▼───────────────▼───────────────────────────┐
-│               LLM Gateway + Health Monitor            │
+│               LLM Gateway + Health Monitor           │
 │    ┌──────────────┐  ┌──────────┐  ┌──────────────┐  │
 │    │ LAN LLM      │  │ Claude   │  │ OpenAI       │  │
-│    │ (preferred)   │  │ (fallback)│  │ (fallback)   │  │
+│    │ (preferred)  │  │ (fallback)│  │ (fallback)  │  │
 │    └──────────────┘  └──────────┘  └──────────────┘  │
 └──────────────────────────────────────────────────────┘
            │
 ┌──────────▼───────────────────────────────────────────┐
-│              Hardware (Claw Controller)                │
-│              GPIO via RPi.GPIO / gpiozero             │
+│              Hardware (Claw Controller)              │
+│                                                      │
 └──────────────────────────────────────────────────────┘
 ```
 
