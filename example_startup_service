@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cd /home/pi/Documents/pi-openclaw/
+cd /home/user/Documents/auto-claw/
 
 ssh-agent bash -c "git pull origin"
 
