@@ -1,6 +1,6 @@
 #!/bin/bash
 
-sudo chmod +x /home/pi/Documents/pi-openclaw/jobs/example_startup_service
+sudo chmod +x /home/user/Documents/auto-claw/jobs/example_startup_service
 
 cd /etc/systemd/system
 
@@ -9,7 +9,7 @@ Description='OpenClaw startup service.'
 
 [Service]
 User=pi
-ExecStart=/home/pi/Documents/pi-openclaw/jobs/example_startup_service
+ExecStart=/home/user/Documents/auto-claw/jobs/example_startup_service
 Restart=always
 
 [Install]
